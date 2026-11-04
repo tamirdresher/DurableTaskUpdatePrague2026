@@ -1,0 +1,2 @@
+durabletask==1.13.0
+durabletask.azuremanaged==1.12.0

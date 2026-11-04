@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\BookingDemo.Core\BookingDemo.Core.csproj" />
+    <PackageReference Include="Microsoft.DurableTask.Worker.AzureManaged" Version="1.27.0" />
+    <PackageReference Include="Microsoft.DurableTask.Client.AzureManaged" Version="1.27.0" />
+    <PackageReference Include="Microsoft.Agents.AI.DurableTask" Version="1.16.0-preview.261029.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+  </ItemGroup>
+</Project>

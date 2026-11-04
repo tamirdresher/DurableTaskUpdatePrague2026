@@ -1,0 +1,8 @@
+**/bin/
+**/obj/
+data/
+artifacts/
+TestResults/
+.stage/
+__pycache__/
+.venv/
