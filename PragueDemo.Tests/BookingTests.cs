@@ -8,10 +8,13 @@ using B = BookingDemo;
 
 namespace PragueDemo.Tests;
 
+// Each test gets its own ledger folder, deleted in Dispose.
 public sealed class BookingTests : IDisposable
 {
     private readonly B.BookingLedger ledger = new(Path.Combine(Environment.CurrentDirectory, "test-data-booking", Guid.NewGuid().ToString("N")));
     private readonly DateTime now = DateTime.UtcNow;
+
+    // A valid proposal, a matching receipt from the fixture approver, and a check and booking command bound to them.
     private B.ItineraryProposal Proposal() => new(Guid.NewGuid().ToString(), 1, new("trip"), "SCRIPTED planner",
         "SCRIPTED reviewer", B.MockBookingClient.TotalEstimate, now.AddMinutes(-1), now.AddMinutes(2));
     private B.ApprovalReceipt Receipt(B.ItineraryProposal p) => new(Guid.NewGuid().ToString("N"), "instance",
@@ -40,6 +43,7 @@ public sealed class BookingTests : IDisposable
     [Fact]
     public void SameOperationSurvivesProviderRecreationWithoutDuplicateEffect()
     {
+        // A new ledger over the same folder plays a restarted provider: same key, same booking, two audited attempts.
         B.BookingCommand command = new("stable/hotel", "hotel", new("trip"));
         B.BookingReceipt first = ledger.Book(command, now);
         B.BookingLedger restarted = new(ledger.Root);
@@ -51,6 +55,7 @@ public sealed class BookingTests : IDisposable
     [Fact]
     public void NewNaiveAttemptIdentityDuplicatesAlreadyBookedWork()
     {
+        // The naive demo's problem: the same work under a new key is booked again.
         B.Trip trip = new("same-trip");
         ledger.Book(new("attempt-1/flight", "flight", trip), now);
         ledger.Book(new("attempt-2/flight", "flight", trip), now);
@@ -76,6 +81,7 @@ public sealed class BookingTests : IDisposable
     [InlineData("receipt")]
     public void ApprovalRequiresExactBindingAndFixtureAuthority(string mutation)
     {
+        // Changing any one field of a valid receipt must make it unauthorized.
         B.ItineraryProposal p = Proposal();
         B.ApprovalReceipt r = Receipt(p);
         B.ApprovalCheck check = Check(p, r);
@@ -95,6 +101,8 @@ public sealed class BookingTests : IDisposable
     [Fact]
     public void NotificationAloneAndMalformedReceiptCannotAuthorize()
     {
+        // A receipt ID that isn't a GUID (here, a path) is rejected before any file is read,
+        // and a signal without a receipt authorizes nothing.
         B.ItineraryProposal p = Proposal();
         B.ApprovalCheck check = new("instance", p, new("..\\forged"));
         Assert.False(ledger.Validate(check, now).Authorized);
@@ -105,6 +113,7 @@ public sealed class BookingTests : IDisposable
     [Fact]
     public void DeadlineIsExclusiveAndBackdatedReceiptRejected()
     {
+        // Rejected: checked exactly at the deadline, issued exactly at the deadline, or issued before the proposal existed.
         B.ItineraryProposal p = Proposal();
         B.ApprovalReceipt r = Receipt(p);
         Assert.False(B.ApprovalPolicy.Evaluate(Check(p, r), r, p.DeadlineUtc).Authorized);
@@ -115,6 +124,8 @@ public sealed class BookingTests : IDisposable
     [Fact]
     public void ImmutableItineraryDigestBindsContentDatesAndBudget()
     {
+        // Recording the same proposal twice is fine. Changing the budget or the deadline changes the digest,
+        // and a different proposal under the same ID throws.
         B.ItineraryProposal p = Proposal();
         ledger.RecordProposal(p);
         ledger.RecordProposal(p);
@@ -126,6 +137,8 @@ public sealed class BookingTests : IDisposable
     [Fact]
     public void ApprovedBookingBindsOperationAndReturnsOriginalAfterExpiredRedelivery()
     {
+        // A redelivery after the deadline returns the original booking; keys that don't match the approved
+        // proposal version are refused.
         B.ItineraryProposal p = Proposal();
         B.ApprovalReceipt r = ledger.IssueReceipt("instance", p, true);
         B.BookingCommand command = Command(Check(p, r), "hotel");
@@ -154,6 +167,7 @@ public sealed class BookingTests : IDisposable
     [Fact]
     public void CrashGateIsConsumedOnceForSameOperationAcrossRestart()
     {
+        // CrashHook's marker: once per checkpoint and operation, even for a new ledger over the same folder.
         Assert.True(ledger.MarkCrashOnce("before-car", "trip/car"));
         Assert.False(new B.BookingLedger(ledger.Root).MarkCrashOnce("before-car", "trip/car"));
         Assert.True(ledger.MarkCrashOnce("before-car", "different-trip/car"));
@@ -162,6 +176,7 @@ public sealed class BookingTests : IDisposable
     [Fact]
     public void ManagedBookingConfigurationIsOnlyRegisteredWithoutTokenOrCloudCall()
     {
+        // Builds the Azure configuration and reads the options back; no token is requested and nothing calls Azure.
         ServiceCollection services = new();
         services.AddLogging();
         BookingIntro.ManagedHostingExample.ConfigureWorker(services, "https://scheduler.example.invalid", "existing-hub", ledger);
@@ -180,9 +195,11 @@ public sealed class BookingTests : IDisposable
     [InlineData("BudgetReviewer", "OFFLINE SCRIPTED BUDGET REVIEWER")]
     public async Task DurableAgentStreamingIsConspicuouslyScripted(string name, string label)
     {
+        // The streaming path returns the same labelled, scripted text.
         using ScriptedTripChatClient client = new(name, ledger);
         List<Microsoft.Extensions.AI.ChatResponseUpdate> updates = [];
-        await foreach (var update in client.GetStreamingResponseAsync([])) updates.Add(update);
+        await foreach (var update in client.GetStreamingResponseAsync([]))
+            updates.Add(update);
         Assert.Contains(updates, update => update.Text.Contains(label));
     }
 

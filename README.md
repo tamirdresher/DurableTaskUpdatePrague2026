@@ -57,13 +57,15 @@ python -m venv .venv
 ./.venv/Scripts/python -m pip install -r requirements.txt --index-url https://packagefeedproxy.microsoft.io/pypi/simple/
 
 # Terminal 1: a worker that dies right before the car booking
-$env:PRAGUE_BOOKING_CRASH = 'before-car'; ./.venv/Scripts/python book_trip.py worker
+$env:PRAGUE_BOOKING_CRASH = 'before-car'
+./.venv/Scripts/python book_trip.py worker
 
 # Terminal 2: book a trip
 ./.venv/Scripts/python book_trip.py start py-trip-1
 
 # Terminal 1 again: a new worker resumes the same trip
-Remove-Item Env:PRAGUE_BOOKING_CRASH; ./.venv/Scripts/python book_trip.py worker
+Remove-Item Env:PRAGUE_BOOKING_CRASH
+./.venv/Scripts/python book_trip.py worker
 
 # Terminal 2
 ./.venv/Scripts/python book_trip.py wait py-trip-1

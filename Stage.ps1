@@ -45,6 +45,7 @@ $IntroDll = Join-Path $Root 'BookingIntro\bin\Debug\net10.0\BookingIntro.dll'
 $AgentsDll = Join-Path $Root 'BookingAgents\bin\Debug\net10.0\BookingAgents.dll'
 $script:Pause = -not ($NoPause -or $Act -eq 'rehearse')
 $script:Failures = [Collections.Generic.List[string]]::new()
+# The acts set these variables for the demo CLIs; the finally block at the end restores them.
 $savedEnv = @{}
 foreach ($name in 'PRAGUE_BOOKING_DATA', 'PRAGUE_DTS_ENDPOINT', 'PRAGUE_BOOKING_CRASH') {
     $savedEnv[$name] = [Environment]::GetEnvironmentVariable($name)
@@ -62,6 +63,7 @@ function Title([string] $Text) {
     Write-Host ('  ' + ('-' * $Text.Length)) -ForegroundColor DarkCyan
 }
 
+# One stage step: waits for Enter, or just prints the step with -NoPause and during rehearse.
 function Next([string] $Text) {
     Write-Host ''
     if (-not $script:Pause) {
@@ -72,8 +74,11 @@ function Next([string] $Text) {
     [void] (Read-Host)
 }
 
+# A failed check doesn't stop the act: it's shown on screen, and the script exits with code 1 at the end.
 function Expect([bool] $Condition, [string] $Message) {
-    if ($Condition) { return }
+    if ($Condition) {
+        return
+    }
     $script:Failures.Add($Message)
     Say "UNEXPECTED: $Message" Red
     Say 'Fallback: show the captured run (appendix slide "Use real captures").' DarkGray
@@ -81,8 +86,11 @@ function Expect([bool] $Condition, [string] $Message) {
 
 # ---------- state ----------
 
+# .stage\state.json: the emulator container, ports, run folder, instance counter and the workers we started.
 function Get-State {
-    if (-not (Test-Path $StatePath)) { return $null }
+    if (-not (Test-Path $StatePath)) {
+        return $null
+    }
     return Get-Content $StatePath -Raw | ConvertFrom-Json -AsHashtable
 }
 
@@ -92,14 +100,19 @@ function Save-State([hashtable] $State) {
 }
 
 function Test-ContainerRunning([string] $Id) {
-    if (-not $Id) { return $false }
+    if (-not $Id) {
+        return $false
+    }
     $running = & docker inspect --format '{{.State.Running}}' $Id 2>$null
     return $LASTEXITCODE -eq 0 -and "$running".Trim() -eq 'true'
 }
 
+# Loads the state for an act and points the demo CLIs at this session's emulator.
 function Use-State([switch] $WithoutEmulator) {
     $state = Get-State
-    if ($null -eq $state) { throw 'Not set up yet. Run: .\Stage.ps1 setup' }
+    if ($null -eq $state) {
+        throw 'Not set up yet. Run: .\Stage.ps1 setup'
+    }
     if (-not $WithoutEmulator -and -not (Test-ContainerRunning $state.containerId)) {
         throw 'The emulator container is not running. Run .\Stage.ps1 cleanup, then .\Stage.ps1 setup'
     }
@@ -107,6 +120,7 @@ function Use-State([switch] $WithoutEmulator) {
     return $state
 }
 
+# trip-1, trip-2, ...: every run of an act gets a fresh instance ID.
 function New-InstanceId([hashtable] $State, [string] $Prefix) {
     $State.counter = [int] $State.counter + 1
     Save-State $State
@@ -121,6 +135,7 @@ function Assert-Built {
 
 # ---------- demo CLIs and owned workers ----------
 
+# Runs one demo CLI command and parses its JSON output.
 function Invoke-Demo([string] $Dll, [string[]] $Arguments) {
     $text = & dotnet $Dll @Arguments | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -129,6 +144,8 @@ function Invoke-Demo([string] $Dll, [string[]] $Arguments) {
     return $text | ConvertFrom-Json
 }
 
+# Starts a worker in the background, logging to the run folder. Its PID and start time go into the state,
+# so cleanup can tell our workers from other processes that later reuse the PID.
 function Start-Worker([hashtable] $State, [string] $Dll, [string] $Data, [string] $Name, [string] $Crash = '') {
     $State.workerCount = [int] $State.workerCount + 1
     $log = Join-Path $State.runDir ('{0:00}-{1}.log' -f $State.workerCount, $Name)
@@ -177,12 +194,17 @@ function Stop-OwnedWorkers([hashtable] $State) {
     Save-State $State
 }
 
+# Returns the complete lines added to a log since the last call; a partial last line waits for the next call.
 function Read-NewLines([string] $Path, [ref] $Offset) {
-    if (-not (Test-Path $Path)) { return @() }
+    if (-not (Test-Path $Path)) {
+        return @()
+    }
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
         [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
     try {
-        if ($stream.Length -le $Offset.Value) { return @() }
+        if ($stream.Length -le $Offset.Value) {
+            return @()
+        }
         [void] $stream.Seek($Offset.Value, [IO.SeekOrigin]::Begin)
         $buffer = [byte[]]::new($stream.Length - $Offset.Value)
         $read = $stream.Read($buffer, 0, $buffer.Length)
@@ -191,22 +213,41 @@ function Read-NewLines([string] $Path, [ref] $Offset) {
         $stream.Dispose()
     }
     $end = [Array]::LastIndexOf($buffer, [byte] 10, $read - 1)
-    if ($end -lt 0) { return @() }
+    if ($end -lt 0) {
+        return @()
+    }
     $Offset.Value += $end + 1
     $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $end + 1)
     return @($text -split "`r?`n" | Where-Object { $_ })
 }
 
+# Turns a worker log line into the short line the audience sees; other lines are ignored.
 function Show-WorkerLine([string] $Line) {
     switch -Regex ($Line) {
-        "'(\w+)' orchestration with ID '[^']+' started" { Say ('worker   {0} running' -f $Matches[1]) White; return }
-        "'(\w+)' activity of orchestration ID '[^']+' started" { Say ('worker   {0,-11} started' -f $Matches[1]) DarkYellow; return }
-        "'(\w+)' activity of orchestration ID '[^']+' completed" { Say ('worker   {0,-11} done' -f $Matches[1]) Green; return }
-        "'(\w+)' orchestration with ID '[^']+' completed" { Say ('worker   {0} completed' -f $Matches[1]) Green; return }
-        'CONTROLLED CRASH: ([\w-]+); owned PID=(\d+)' { Say ('worker   CRASH: process {0} died ({1})' -f $Matches[2], $Matches[1]) Red; return }
+        "'(\w+)' orchestration with ID '[^']+' started" {
+            Say ('worker   {0} running' -f $Matches[1]) White
+            return
+        }
+        "'(\w+)' activity of orchestration ID '[^']+' started" {
+            Say ('worker   {0,-11} started' -f $Matches[1]) DarkYellow
+            return
+        }
+        "'(\w+)' activity of orchestration ID '[^']+' completed" {
+            Say ('worker   {0,-11} done' -f $Matches[1]) Green
+            return
+        }
+        "'(\w+)' orchestration with ID '[^']+' completed" {
+            Say ('worker   {0} completed' -f $Matches[1]) Green
+            return
+        }
+        'CONTROLLED CRASH: ([\w-]+); owned PID=(\d+)' {
+            Say ('worker   CRASH: process {0} died ({1})' -f $Matches[2], $Matches[1]) Red
+            return
+        }
     }
 }
 
+# Shows the worker's log as it grows, until $Done says the step is over ($true) or the timeout passes ($false).
 function Watch-Worker($Worker, [scriptblock] $Done, [int] $TimeoutSeconds, [string] $Waiting) {
     $offset = [long] 0
     $lines = [Collections.Generic.List[string]]::new()
@@ -218,8 +259,12 @@ function Watch-Worker($Worker, [scriptblock] $Done, [int] $TimeoutSeconds, [stri
             $lines.Add($line)
             Show-WorkerLine $line
         }
-        if ($finished -or [bool] (& $Done $Worker $lines)) { return $true }
-        if ([DateTime]::UtcNow -gt $deadline) { return $false }
+        if ($finished -or [bool] (& $Done $Worker $lines)) {
+            return $true
+        }
+        if ([DateTime]::UtcNow -gt $deadline) {
+            return $false
+        }
         if ([DateTime]::UtcNow -gt $notice) {
             Say $Waiting DarkGray
             $notice = [DateTime]::UtcNow.AddSeconds(8)
@@ -228,17 +273,21 @@ function Watch-Worker($Worker, [scriptblock] $Done, [int] $TimeoutSeconds, [stri
     }
 }
 
+# A worker is ready once its log shows the streaming connection to the scheduler.
 function Wait-Connected($Worker) {
     $connected = Watch-Worker $Worker {
         param($w, $lines)
         $w.Process.HasExited -or @($lines -match 'streaming connection established').Count -gt 0
     } 30 'worker connecting...'
-    if (-not $connected -or $Worker.Process.HasExited) { throw "Worker $($Worker.Name) did not connect. Log: $($Worker.Log)" }
+    if (-not $connected -or $Worker.Process.HasExited) {
+        throw "Worker $($Worker.Name) did not connect. Log: $($Worker.Log)"
+    }
     Say "worker   process $($Worker.Process.Id) connected to the scheduler" DarkGray
 }
 
 # ---------- what the audience sees ----------
 
+# Bookings and the audit log are read straight from the fake provider's files.
 function Get-Bookings([string] $Data) {
     return @(Get-ChildItem -Path $Data -Filter 'booking-*.json' -ErrorAction SilentlyContinue |
         ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json })
@@ -246,10 +295,13 @@ function Get-Bookings([string] $Data) {
 
 function Get-Audit([string] $Data) {
     $path = Join-Path $Data 'audit.jsonl'
-    if (-not (Test-Path $path)) { return @() }
+    if (-not (Test-Path $path)) {
+        return @()
+    }
     return @(Get-Content $path | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
 }
 
+# Prints the booked count per service (green for one, red for duplicates) and returns the counts.
 function Show-Bookings([string] $Data) {
     $bookings = Get-Bookings $Data
     $counts = @{}
@@ -258,7 +310,17 @@ function Show-Bookings([string] $Data) {
     foreach ($service in 'flight', 'hotel', 'car') {
         $count = @($bookings | Where-Object Service -eq $service).Count
         $counts[$service] = $count
-        $color = switch ($count) { 0 { 'DarkYellow' } 1 { 'Green' } default { 'Red' } }
+        $color = switch ($count) {
+            0 {
+                'DarkYellow'
+            }
+            1 {
+                'Green'
+            }
+            default {
+                'Red'
+            }
+        }
         Write-Host ('  {0} {1} ' -f $service, $count) -ForegroundColor $color -NoNewline
     }
     Write-Host ''
@@ -269,11 +331,14 @@ function Test-Counts([hashtable] $Counts, [int] $Flight, [int] $Hotel, [int] $Ca
     return $Counts.flight -eq $Flight -and $Counts.hotel -eq $Hotel -and $Counts.car -eq $Car
 }
 
+# Reads the scheduler's history and shows which activities already have a saved result.
 function Show-History([string] $Id) {
     $events = @(Invoke-Demo $IntroDll @('history', $Id))
     $completed = @{}
     foreach ($event in $events) {
-        if ($event.EventType -eq 'TaskCompleted') { $completed[[int] $event.TaskScheduledId] = $true }
+        if ($event.EventType -eq 'TaskCompleted') {
+            $completed[[int] $event.TaskScheduledId] = $true
+        }
     }
     $saved = 0
     $finished = $false
@@ -297,6 +362,7 @@ function Show-History([string] $Id) {
     return @{ saved = $saved; finished = $finished }
 }
 
+# Every provider call from the audit log: a new booking, or a repeated key that returned the existing booking.
 function Show-Attempts([string] $Data, [string] $Service = '') {
     $attempts = @(Get-Audit $Data | Where-Object {
             $_.kind -eq 'booking-attempt' -and (-not $Service -or $_.details.Service -eq $Service)
@@ -310,18 +376,26 @@ function Show-Attempts([string] $Data, [string] $Service = '') {
     return $attempts
 }
 
+# Scripted model calls, counted from the audit log.
 function Get-ModelCalls([string] $Data) {
     return @(Get-Audit $Data | Where-Object kind -eq 'fixture-model-call').Count
 }
 
+# Polls the agents workflow until $Until is true; returns $null on timeout and throws if the workflow failed.
 function Wait-Agents([string] $Id, [scriptblock] $Until, [int] $Seconds, [string] $Waiting) {
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     $notice = [DateTime]::UtcNow.AddSeconds(8)
     while ($true) {
         $status = Invoke-Demo $AgentsDll @('status', $Id)
-        if ($status.runtimeStatus -eq 'Failed') { throw "Workflow $Id failed: $($status.failure)" }
-        if ([bool] (& $Until $status)) { return $status }
-        if ([DateTime]::UtcNow -gt $deadline) { return $null }
+        if ($status.runtimeStatus -eq 'Failed') {
+            throw "Workflow $Id failed: $($status.failure)"
+        }
+        if ([bool] (& $Until $status)) {
+            return $status
+        }
+        if ([DateTime]::UtcNow -gt $deadline) {
+            return $null
+        }
         if ([DateTime]::UtcNow -gt $notice) {
             Say $Waiting DarkGray
             $notice = [DateTime]::UtcNow.AddSeconds(8)
@@ -330,17 +404,21 @@ function Wait-Agents([string] $Id, [scriptblock] $Until, [int] $Seconds, [string
     }
 }
 
+# Strips the fixture labels, so the projector shows just the plan.
 function Format-ModelText([string] $Text) {
     return (($Text -replace '^OFFLINE SCRIPTED [A-Z ]+:\s*', '') -replace ';\s*MOCK providers only\.?$', '.') -replace '\bMOCK\s+', ''
 }
 
+# Seconds the emulator's clock is ahead of this machine's (negative: behind), or $null if it can't be read.
 function Get-ClockSkew([string] $ContainerId) {
     # Docker Desktop's VM clock can drift from Windows' (often after sleep). The scheduler stamps
     # itineraries with the VM clock, while approvals are stamped by this machine.
     $before = [DateTimeOffset]::UtcNow
     $vm = (& docker exec $ContainerId date -u +%s.%N 2>$null | Out-String).Trim()
     $after = [DateTimeOffset]::UtcNow
-    if ($LASTEXITCODE -ne 0 -or $vm -notmatch '^\d+(\.\d+)?$') { return $null }
+    if ($LASTEXITCODE -ne 0 -or $vm -notmatch '^\d+(\.\d+)?$') {
+        return $null
+    }
     return [double] $vm - ($before.ToUnixTimeMilliseconds() + $after.ToUnixTimeMilliseconds()) / 2000.0
 }
 
@@ -362,14 +440,20 @@ function Wait-ClockCatchUp($Proposal) {
     # The approval receipt must not look older than the itinerary it approves.
     $created = ([datetime] $Proposal.CreatedUtc).ToUniversalTime()
     $wait = [Math]::Ceiling(($created - [DateTime]::UtcNow).TotalSeconds + 1)
-    if ($wait -le 0) { return }
-    if ($wait -gt 120) { throw "Docker's clock is $wait s ahead. Run cleanup, then wsl --shutdown, restart Docker Desktop, and run setup again." }
+    if ($wait -le 0) {
+        return
+    }
+    if ($wait -gt 120) {
+        throw "Docker's clock is $wait s ahead. Run cleanup, then wsl --shutdown, restart Docker Desktop, and run setup again."
+    }
     Say "waiting $wait s for this machine's clock to pass the itinerary time (Docker clock drift)..." DarkGray
     Start-Sleep -Seconds $wait
 }
 
 # ---------- acts ----------
 
+# setup: builds the demos if needed, starts a fresh emulator container, waits for its dashboard, checks its
+# clock and warms up the CLIs. If a setup is already running, it just shows the status.
 function Invoke-Setup {
     $existing = Get-State
     if ($null -ne $existing -and (Test-ContainerRunning $existing.containerId)) {
@@ -382,21 +466,36 @@ function Invoke-Setup {
         Invoke-Cleanup $existing
     }
     Title 'Stage setup'
-    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw '.NET 10 SDK not found.' }
+    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+        throw '.NET 10 SDK not found.'
+    }
     if (-not (Test-Path $IntroDll) -or -not (Test-Path $AgentsDll)) {
         Say 'building the demos...' DarkGray
         & dotnet build (Join-Path $Root 'PragueDurableTask.sln') -nologo -v q | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Build failed.'
+        }
     }
     $null = & docker info --format '{{.ServerVersion}}' 2>$null
-    if ($LASTEXITCODE -ne 0) { throw 'Docker is not running. Start Docker Desktop (Linux containers).' }
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Docker is not running. Start Docker Desktop (Linux containers).'
+    }
     $null = & docker image inspect $EmulatorImage --format '{{.Id}}' 2>$null
-    if ($LASTEXITCODE -ne 0) { throw "Emulator image is not on this machine. Before the talk run: docker pull $EmulatorImage" }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Emulator image is not on this machine. Before the talk run: docker pull $EmulatorImage"
+    }
+    # Fail early if a port is taken, before starting anything.
     foreach ($port in $GrpcPort, $DashboardPort) {
         $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $port)
-        try { $listener.Start() }
-        catch { throw "Port $port is in use. Choose others with -GrpcPort / -DashboardPort." }
-        finally { $listener.Stop() }
+        try {
+            $listener.Start()
+        }
+        catch {
+            throw "Port $port is in use. Choose others with -GrpcPort / -DashboardPort."
+        }
+        finally {
+            $listener.Stop()
+        }
     }
 
     $run = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -405,7 +504,9 @@ function Invoke-Setup {
     $containerName = "prague-stage-$run"
     $containerId = (& docker run --pull never --name $containerName -d `
             -p "127.0.0.1:${GrpcPort}:8080" -p "127.0.0.1:${DashboardPort}:8082" $EmulatorImage | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $containerId) { throw 'Could not start the emulator container.' }
+    if ($LASTEXITCODE -ne 0 -or -not $containerId) {
+        throw 'Could not start the emulator container.'
+    }
     $state = @{
         run = $run; runDir = $runDir; containerId = $containerId; containerName = $containerName
         grpcPort = $GrpcPort; dashboardPort = $DashboardPort; counter = 0; workerCount = 0; workers = @()
@@ -413,6 +514,7 @@ function Invoke-Setup {
     Save-State $state
     Say "emulator container $containerName started" DarkGray
 
+    # The emulator is ready when its dashboard answers.
     $http = [Net.Http.HttpClient]::new()
     $http.Timeout = [TimeSpan]::FromSeconds(2)
     $ready = $false
@@ -423,14 +525,20 @@ function Invoke-Setup {
                 $ready = $response.IsSuccessStatusCode
                 $response.Dispose()
             }
-            catch { }
-            if (-not $ready) { Start-Sleep -Seconds 1 }
+            catch {
+                # Not listening yet; try again.
+            }
+            if (-not $ready) {
+                Start-Sleep -Seconds 1
+            }
         }
     }
     finally {
         $http.Dispose()
     }
-    if (-not $ready) { throw 'The emulator dashboard did not respond. Run .\Stage.ps1 cleanup and try again.' }
+    if (-not $ready) {
+        throw 'The emulator dashboard did not respond. Run .\Stage.ps1 cleanup and try again.'
+    }
     $state.clockSkew = Get-ClockSkew $containerId
     Save-State $state
     Show-ClockSkew $state.clockSkew
@@ -443,10 +551,14 @@ function Invoke-Setup {
 
     Say "Ready. Scheduler emulator: localhost:$GrpcPort   Dashboard: http://localhost:$DashboardPort" Green
     Say 'Acts: naive | crash | ackgap | agents     Afterwards: cleanup' DarkGray
-    if ($OpenDashboard) { Start-Process "http://localhost:$DashboardPort" }
+    if ($OpenDashboard) {
+        Start-Process "http://localhost:$DashboardPort"
+    }
     return $state
 }
 
+# naive: three plain awaits, no scheduler. The run dies before the car, and the rerun books the flight
+# and the hotel again.
 function Invoke-Naive([hashtable] $State) {
     Assert-Built
     $data = Join-Path $State.runDir ('naive-{0}' -f (Get-Date -Format 'HHmmss'))
@@ -454,9 +566,15 @@ function Invoke-Naive([hashtable] $State) {
     Title 'Three plain awaits: book a flight, a hotel and a car'
     Next 'Run it. The process will die right before the car.'
     $env:PRAGUE_BOOKING_CRASH = 'before-car'
-    try { $output = & dotnet $IntroDll naive seattle-trip 2>&1 | Out-String }
-    finally { $env:PRAGUE_BOOKING_CRASH = $null }
-    if ($output -match 'owned PID=(\d+)') { Say "CRASH: process $($Matches[1]) died before booking the car" Red }
+    try {
+        $output = & dotnet $IntroDll naive seattle-trip 2>&1 | Out-String
+    }
+    finally {
+        $env:PRAGUE_BOOKING_CRASH = $null
+    }
+    if ($output -match 'owned PID=(\d+)') {
+        Say "CRASH: process $($Matches[1]) died before booking the car" Red
+    }
     $counts = Show-Bookings $data
     Expect (Test-Counts $counts 1 1 0) 'expected flight 1, hotel 1, car 0 after the crash'
 
@@ -469,6 +587,7 @@ function Invoke-Naive([hashtable] $State) {
     Say 'Two flights. Two hotels. Nothing remembered what already happened.' Red
 }
 
+# crash: the durable worker dies before the car. A new worker replays the history and books only the car.
 function Invoke-Crash([hashtable] $State) {
     Assert-Built
     $id = New-InstanceId $State 'trip'
@@ -482,7 +601,10 @@ function Invoke-Crash([hashtable] $State) {
     $env:PRAGUE_BOOKING_DATA = $data
     $null = Invoke-Demo $IntroDll @('start', $id)
     Say "client   started '$id'" White
-    $crashed = Watch-Worker $first { param($w, $lines) $w.Process.HasExited } 60 'still booking...'
+    $crashed = Watch-Worker $first {
+        param($w, $lines)
+        $w.Process.HasExited
+    } 60 'still booking...'
     Expect $crashed 'the worker did not reach the crash point'
     Remove-WorkerRecord $State $first.Process.Id
     $counts = Show-Bookings $data
@@ -497,7 +619,9 @@ function Invoke-Crash([hashtable] $State) {
         param($w, $lines)
         @($lines -match "orchestration with ID '$id' completed").Count -gt 0
     } 120 'the scheduler is handing the unfinished car booking to the new worker...'
-    if (-not $done) { $null = Invoke-Demo $IntroDll @('wait', $id) }
+    if (-not $done) {
+        $null = Invoke-Demo $IntroDll @('wait', $id)
+    }
     Say ('resumed and finished in {0:N0} s' -f $timer.Elapsed.TotalSeconds) DarkGray
     $status = Invoke-Demo $IntroDll @('status', $id)
     Expect ($status.runtimeStatus -eq 'Completed') "trip '$id' did not complete"
@@ -513,6 +637,8 @@ function Invoke-Crash([hashtable] $State) {
     Stop-Worker $State $second
 }
 
+# ackgap: the hotel is booked, but the worker dies before reporting back. The hotel activity runs again,
+# and the provider's operation ID keeps it to one hotel.
 function Invoke-AckGap([hashtable] $State) {
     Assert-Built
     $id = New-InstanceId $State 'trip'
@@ -526,7 +652,10 @@ function Invoke-AckGap([hashtable] $State) {
     $env:PRAGUE_BOOKING_DATA = $data
     $null = Invoke-Demo $IntroDll @('start', $id)
     Say "client   started '$id'" White
-    $crashed = Watch-Worker $first { param($w, $lines) $w.Process.HasExited } 60 'still booking...'
+    $crashed = Watch-Worker $first {
+        param($w, $lines)
+        $w.Process.HasExited
+    } 60 'still booking...'
     Expect $crashed 'the worker did not reach the crash point'
     Remove-WorkerRecord $State $first.Process.Id
     $counts = Show-Bookings $data
@@ -541,7 +670,9 @@ function Invoke-AckGap([hashtable] $State) {
         param($w, $lines)
         @($lines -match "orchestration with ID '$id' completed").Count -gt 0
     } 120 'the scheduler is handing the unacknowledged hotel booking to the new worker...'
-    if (-not $done) { $null = Invoke-Demo $IntroDll @('wait', $id) }
+    if (-not $done) {
+        $null = Invoke-Demo $IntroDll @('wait', $id)
+    }
     $hotel = @(Show-Attempts $data 'hotel')
     Expect ($hotel.Count -eq 2 -and @($hotel | Where-Object { $_.details.created }).Count -eq 1) 'expected two hotel attempts and one hotel booking'
     $counts = Show-Bookings $data
@@ -551,6 +682,8 @@ function Invoke-AckGap([hashtable] $State) {
     Stop-Worker $State $second
 }
 
+# agents: two agents plan, the worker is killed, a fake approval is rejected, then the traveler approves
+# and the trip is booked. The models must not be called again after the restart.
 function Invoke-Agents([hashtable] $State) {
     Assert-Built
     # The agents worker registers a different set of tasks on the same task hub.
@@ -560,7 +693,9 @@ function Invoke-Agents([hashtable] $State) {
     Title "Durable agents '$id': plan, crash, approve, book"
     $first = Start-Worker $State $AgentsDll $data 'agents'
     Start-Sleep -Seconds 2
-    if ($first.Process.HasExited) { throw "The agents worker exited. Log: $($first.Log)" }
+    if ($first.Process.HasExited) {
+        throw "The agents worker exited. Log: $($first.Log)"
+    }
     Say "worker   process $($first.Process.Id) started (TripPlanner + BudgetReviewer agents)" DarkGray
 
     Next 'Ask the agents to plan the trip.'
@@ -570,7 +705,9 @@ function Invoke-Agents([hashtable] $State) {
         param($s)
         $null -ne $s.status -and $s.status.Phase -eq 'AwaitingApproval'
     } 90 'agents are planning...'
-    if ($null -eq $before) { throw "'$id' never reached AwaitingApproval." }
+    if ($null -eq $before) {
+        throw "'$id' never reached AwaitingApproval."
+    }
     $proposal = $before.status.Proposal
     Write-Host ''
     Say ('TripPlanner     {0}' -f (Format-ModelText $proposal.PlannerOutput)) White
@@ -588,7 +725,9 @@ function Invoke-Agents([hashtable] $State) {
     Next 'Start a new worker.'
     $second = Start-Worker $State $AgentsDll $data 'agents-restart'
     Start-Sleep -Seconds 2
-    if ($second.Process.HasExited) { throw "The agents worker exited. Log: $($second.Log)" }
+    if ($second.Process.HasExited) {
+        throw "The agents worker exited. Log: $($second.Log)"
+    }
     Say "worker   process $($second.Process.Id) started" DarkGray
 
     Next 'Send an approval event with no real receipt behind it.'
@@ -597,7 +736,9 @@ function Invoke-Agents([hashtable] $State) {
         param($s)
         $null -ne $s.status -and $null -ne $s.status.Detail
     } 90 'the new worker is replaying the workflow...'
-    if ($null -eq $after) { throw "'$id' did not process the event." }
+    if ($null -eq $after) {
+        throw "'$id' did not process the event."
+    }
     Say "rejected: $($after.status.Detail)" Red
     $calls = Get-ModelCalls $data
     Say "model calls $calls   (planner and reviewer results came back from history)" Green
@@ -615,6 +756,7 @@ function Invoke-Agents([hashtable] $State) {
     Stop-Worker $State $second
 }
 
+# status: the emulator, the dashboard, the run folder and the workers this session started.
 function Show-Status($State) {
     if ($null -eq $State) {
         Say 'Not set up. Run: .\Stage.ps1 setup' Yellow
@@ -622,7 +764,9 @@ function Show-Status($State) {
     }
     $running = Test-ContainerRunning $State.containerId
     Say ("emulator   {0}  ({1})" -f ($running ? 'running' : 'NOT running'), $State.containerName) ($running ? 'Green' : 'Red')
-    if ($running) { Show-ClockSkew (Get-ClockSkew $State.containerId) }
+    if ($running) {
+        Show-ClockSkew (Get-ClockSkew $State.containerId)
+    }
     Say "dashboard  http://localhost:$($State.dashboardPort)" Gray
     Say "artifacts  $($State.runDir)" Gray
     foreach ($record in @($State.workers)) {
@@ -632,6 +776,7 @@ function Show-Status($State) {
     }
 }
 
+# cleanup: stops the workers this script started and removes the emulator container; the artifacts stay.
 function Invoke-Cleanup($State) {
     if ($null -eq $State) {
         Say 'Nothing to clean up.' DarkGray
@@ -646,6 +791,7 @@ function Invoke-Cleanup($State) {
     Say "Artifacts kept in $($State.runDir)" DarkGray
 }
 
+# rehearse: every act without pauses on a fresh emulator, then cleanup and a timing summary.
 function Invoke-Rehearse {
     if ($null -ne (Get-State)) {
         throw 'A stage session is already set up. Rehearse before setup, or run .\Stage.ps1 cleanup first.'
@@ -656,10 +802,18 @@ function Invoke-Rehearse {
         foreach ($name in 'naive', 'crash', 'ackgap', 'agents') {
             $timer = [Diagnostics.Stopwatch]::StartNew()
             switch ($name) {
-                'naive' { Invoke-Naive (Use-State -WithoutEmulator) }
-                'crash' { Invoke-Crash (Use-State) }
-                'ackgap' { Invoke-AckGap (Use-State) }
-                'agents' { Invoke-Agents (Use-State) }
+                'naive' {
+                    Invoke-Naive (Use-State -WithoutEmulator)
+                }
+                'crash' {
+                    Invoke-Crash (Use-State)
+                }
+                'ackgap' {
+                    Invoke-AckGap (Use-State)
+                }
+                'agents' {
+                    Invoke-Agents (Use-State)
+                }
             }
             $times[$name] = $timer.Elapsed.TotalSeconds
         }
@@ -668,30 +822,53 @@ function Invoke-Rehearse {
         Invoke-Cleanup (Get-State)
     }
     Title 'Rehearsal summary (machine time only, without talking)'
-    foreach ($entry in $times.GetEnumerator()) { Say ('{0,-7} {1,5:N0} s' -f $entry.Key, $entry.Value) Gray }
+    foreach ($entry in $times.GetEnumerator()) {
+        Say ('{0,-7} {1,5:N0} s' -f $entry.Key, $entry.Value) Gray
+    }
 }
 
 # ---------- main ----------
 
 try {
     switch ($Act) {
-        'setup' { $null = Invoke-Setup }
-        'naive' { Invoke-Naive (Use-State -WithoutEmulator) }
-        'crash' { Invoke-Crash (Use-State) }
-        'ackgap' { Invoke-AckGap (Use-State) }
-        'agents' { Invoke-Agents (Use-State) }
-        'status' { Show-Status (Get-State) }
-        'cleanup' { Invoke-Cleanup (Get-State) }
-        'rehearse' { Invoke-Rehearse }
+        'setup' {
+            $null = Invoke-Setup
+        }
+        'naive' {
+            Invoke-Naive (Use-State -WithoutEmulator)
+        }
+        'crash' {
+            Invoke-Crash (Use-State)
+        }
+        'ackgap' {
+            Invoke-AckGap (Use-State)
+        }
+        'agents' {
+            Invoke-Agents (Use-State)
+        }
+        'status' {
+            Show-Status (Get-State)
+        }
+        'cleanup' {
+            Invoke-Cleanup (Get-State)
+        }
+        'rehearse' {
+            Invoke-Rehearse
+        }
     }
 }
 finally {
-    foreach ($name in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnv[$name]) }
+    foreach ($name in $savedEnv.Keys) {
+        [Environment]::SetEnvironmentVariable($name, $savedEnv[$name])
+    }
 }
 
+# Any unexpected result makes the script exit with code 1 (rehearse relies on this).
 if ($script:Failures.Count -gt 0) {
     Write-Host ''
     Say "$($script:Failures.Count) unexpected result(s):" Red
-    foreach ($failure in $script:Failures) { Say "- $failure" Red }
+    foreach ($failure in $script:Failures) {
+        Say "- $failure" Red
+    }
     exit 1
 }

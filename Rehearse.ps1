@@ -1,3 +1,6 @@
+# Six end-to-end checks with no pauses, against this script's own emulator container: the naive baseline,
+# both durable crashes, the agents crash and approval, a timeout and a denial. Build the solution first;
+# the evidence and results.json go to artifacts\booking-rehearsal-<run>.
 [CmdletBinding()]
 param(
     [int] $GrpcPort = 18080,
@@ -7,6 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Push-Location $PSScriptRoot
+# Restored in the finally block at the end.
 $previous = @{ data = $env:PRAGUE_BOOKING_DATA; endpoint = $env:PRAGUE_DTS_ENDPOINT; crash = $env:PRAGUE_BOOKING_CRASH }
 $run = [Guid]::NewGuid().ToString('N').Substring(0, 8)
 $artifactPath = Join-Path $PSScriptRoot "artifacts\booking-rehearsal-$run"
@@ -21,13 +25,22 @@ $cases = [Collections.Generic.List[object]]::new()
 $script:Crashes = [Collections.Generic.List[object]]::new()
 
 function Assert-True([bool] $Condition, [string] $Message) {
-    if (-not $Condition) { throw $Message }
+    if (-not $Condition) {
+        throw $Message
+    }
 }
+
+# Runs one demo CLI command and parses its JSON output.
 function Invoke-Booking([string] $Dll, [string[]] $DemoArgs) {
     $text = & dotnet $Dll @DemoArgs | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "Command failed: $($DemoArgs -join ' '): $text" }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed: $($DemoArgs -join ' '): $text"
+    }
     return ($text | ConvertFrom-Json)
 }
+
+# Starts the one worker this script runs at a time, optionally with a crash checkpoint, and checks that
+# it survives startup.
 function Start-Worker([string] $Dll, [string] $Crash = '') {
     $script:WorkerNumber++
     $env:PRAGUE_BOOKING_CRASH = $Crash
@@ -35,47 +48,69 @@ function Start-Worker([string] $Dll, [string] $Crash = '') {
         $script:Worker = Start-Process dotnet -ArgumentList @("`"$Dll`"", 'worker') -PassThru `
             -RedirectStandardOutput (Join-Path $artifactPath "worker-$($script:WorkerNumber).stdout.log") `
             -RedirectStandardError (Join-Path $artifactPath "worker-$($script:WorkerNumber).stderr.log")
-    } finally { $env:PRAGUE_BOOKING_CRASH = $null }
+    }
+    finally {
+        $env:PRAGUE_BOOKING_CRASH = $null
+    }
     Start-Sleep -Seconds 2
     Assert-True (-not $script:Worker.HasExited) 'Owned booking worker exited during startup.'
 }
+
 function Stop-Worker {
     if ($null -ne $script:Worker -and -not $script:Worker.HasExited) {
         Stop-Process -Id $script:Worker.Id -Force
         $script:Worker.WaitForExit()
     }
 }
+
+# Waits for the worker to kill itself at the checkpoint, and records the crash as evidence.
 function Wait-ControlledCrash([string] $Checkpoint) {
     $ownedPid = $script:Worker.Id
     Assert-True ($script:Worker.WaitForExit(60000)) "No controlled worker crash at $Checkpoint."
     Assert-True ($script:Worker.ExitCode -ne 0) 'Crash hook did not kill the worker.'
     $script:Crashes.Add([ordered]@{ checkpoint = $Checkpoint; killedWorkerPid = $ownedPid; mechanism = 'self-PID kill'; utc = [DateTime]::UtcNow })
 }
+
+# The fake provider's audit log: booking attempts, itineraries, model calls, approval checks and crashes.
 function Read-Audit {
     $path = Join-Path $dataPath 'audit.jsonl'
-    if (Test-Path $path) { Get-Content $path | ForEach-Object { $_ | ConvertFrom-Json } }
+    if (Test-Path $path) {
+        Get-Content $path | ForEach-Object { $_ | ConvertFrom-Json }
+    }
 }
+
+# One trip's bookings, read straight from the fake provider's files.
 function Bookings-For([string] $TripId) {
     @(Get-ChildItem $dataPath -Filter 'booking-*.json' | ForEach-Object {
         Get-Content $_.FullName -Raw | ConvertFrom-Json
     } | Where-Object TripId -eq $TripId)
 }
+
+# The state at the crash: flight and hotel booked, car not.
 function Assert-Boundary([string] $TripId) {
     $bookings = @(Bookings-For $TripId)
     Assert-True (@($bookings | Where-Object Service -eq 'flight').Count -eq 1) 'Expected flight=1 at crash.'
     Assert-True (@($bookings | Where-Object Service -eq 'hotel').Count -eq 1) 'Expected hotel=1 at crash.'
     Assert-True (@($bookings | Where-Object Service -eq 'car').Count -eq 0) 'Expected car=0 at crash.'
 }
+
+# Polls the agents workflow's custom status until it reaches $Phase; throws if the workflow fails or time runs out.
 function Wait-Phase([string] $Id, [string] $Phase, [int] $Seconds = 90) {
     $until = [DateTime]::UtcNow.AddSeconds($Seconds)
     do {
         $status = Invoke-Booking $agentsDll @('status', $Id)
-        if ($status.runtimeStatus -eq 'Failed') { throw "Workflow $Id failed: $($status.failure)" }
-        if ($null -ne $status.status -and $status.status.Phase -eq $Phase) { return $status }
+        if ($status.runtimeStatus -eq 'Failed') {
+            throw "Workflow $Id failed: $($status.failure)"
+        }
+        if ($null -ne $status.status -and $status.status.Phase -eq $Phase) {
+            return $status
+        }
         Start-Sleep -Milliseconds 400
     } while ([DateTime]::UtcNow -lt $until)
     throw "Workflow $Id did not reach phase $Phase."
 }
+
+# Saves the instance's status and the scheduler's history as evidence, and checks that the history is real.
 function Export-Instance([string] $Dll, [string] $Id, [string] $Suffix = '') {
     $status = Invoke-Booking $Dll @('status', $Id)
     $status | ConvertTo-Json -Depth 40 | Set-Content (Join-Path $artifactPath "$Id$Suffix.status.json")
@@ -84,13 +119,18 @@ function Export-Instance([string] $Dll, [string] $Id, [string] $Suffix = '') {
     Assert-True (@($history).Count -gt 3) "Real Scheduler history missing for $Id."
     return $history
 }
+
 function Wait-ClockCatchUp($Status) {
     # Itineraries are stamped with the emulator's (Docker VM) clock and receipts with this machine's.
     # Docker Desktop's clock can run ahead; a receipt must not look older than its itinerary.
     $created = ([datetime] $Status.status.Proposal.CreatedUtc).ToUniversalTime()
     $wait = [Math]::Ceiling(($created - [DateTime]::UtcNow).TotalSeconds + 1)
-    if ($wait -gt 120) { throw "Docker's clock is $wait s ahead of this machine. Run wsl --shutdown, restart Docker Desktop and retry." }
-    if ($wait -gt 0) { Start-Sleep -Seconds $wait }
+    if ($wait -gt 120) {
+        throw "Docker's clock is $wait s ahead of this machine. Run wsl --shutdown, restart Docker Desktop and retry."
+    }
+    if ($wait -gt 0) {
+        Start-Sleep -Seconds $wait
+    }
 }
 
 try {
@@ -125,6 +165,7 @@ try {
         killedPid = $baseline.Id; caveat = 'This naive method chooses new operation IDs on restart; stable business keys plus manual recovery could prevent duplicates.' })
     $env:PRAGUE_BOOKING_DATA = $dataPath
 
+    # This run's own emulator, from the pinned image (never pulled here), listening on loopback only.
     & docker image inspect $EmulatorImage --format '{{.Id}}' | Out-Null
     Assert-True ($LASTEXITCODE -eq 0) 'Pinned emulator image unavailable locally; no registry pull attempted.'
     $containerId = (& docker run --pull never --name "prague-booking-$run" -d `
@@ -139,13 +180,23 @@ try {
                 $response = $http.GetAsync("http://127.0.0.1:$DashboardPort").GetAwaiter().GetResult()
                 $ready = $response.IsSuccessStatusCode
                 $response.Dispose()
-                if ($ready) { break }
-            } catch { }
+                if ($ready) {
+                    break
+                }
+            }
+            catch {
+                # Not listening yet; try again.
+            }
             Start-Sleep -Seconds 1
         }
-    } finally { $http.Dispose() }
+    }
+    finally {
+        $http.Dispose()
+    }
     Assert-True $ready 'Emulator dashboard did not become responsive.'
 
+    # Plain Durable Task, crash before the car: the history keeps the flight and the hotel, and a new
+    # worker books only the car.
     $introId = "booking-intro-$run"
     Start-Worker $introDll 'before-car'
     Invoke-Booking $introDll @('start', $introId) | Out-Null
@@ -164,6 +215,8 @@ try {
         recordedCompletionsBeforeCrash = 2; bookingAttemptsAfterRecovery = $attempts.Count })
     Stop-Worker
 
+    # Ack gap: the hotel is booked, but the worker dies before reporting back. The retry reuses the
+    # hotel's key, so there is still only one hotel.
     $gapId = "booking-ack-gap-$run"
     Start-Worker $introDll 'after-hotel-effect'
     Invoke-Booking $introDll @('start', $gapId) | Out-Null
@@ -183,6 +236,8 @@ try {
         instanceId = $gapId; hotelAttempts = 2; actualHotelBookings = 1; sameOperationId = "$gapId/hotel" })
     Stop-Worker
 
+    # Durable agents: kill the worker while it waits for approval. After the restart the models must not be
+    # called again, a forged signal must be rejected, and a real approval must book the trip.
     Start-Worker $agentsDll
     $agentsId = "booking-agents-$run"
     Invoke-Booking $agentsDll @('start', $agentsId, '300') | Out-Null
@@ -200,7 +255,9 @@ try {
     $until = [DateTime]::UtcNow.AddSeconds(90)
     do {
         $after = Wait-Phase $agentsId 'AwaitingApproval'
-        if ($null -ne $after.status.Detail) { break }
+        if ($null -ne $after.status.Detail) {
+            break
+        }
         Start-Sleep -Milliseconds 500
     } while ([DateTime]::UtcNow -lt $until)
     Assert-True ($null -ne $after.status.Detail) 'Forged notification did not fail independent receipt validation.'
@@ -218,6 +275,7 @@ try {
         instanceId = $agentsId; fixtureCallsBefore = 2; fixtureCallsAfter = 2;
         proposalDigest = $before.status.Proposal.Digest; deadlineUtc = $before.status.Proposal.DeadlineUtc })
 
+    # Fixed deadline: an invalid signal doesn't move it, and the timeout books nothing.
     $timeoutId = "booking-timeout-$run"
     Invoke-Booking $agentsDll @('start', $timeoutId, '6') | Out-Null
     $pending = Wait-Phase $timeoutId 'AwaitingApproval'
@@ -229,6 +287,7 @@ try {
     Export-Instance $agentsDll $timeoutId | Out-Null
     $cases.Add([ordered]@{ case = 'approval-fixed-timeout-no-bookings'; realScheduler = $true; passed = $true; instanceId = $timeoutId })
 
+    # A receipt issued for another itinerary is rejected, and a denial books nothing.
     $deniedId = "booking-denied-$run"
     Invoke-Booking $agentsDll @('start', $deniedId, '90') | Out-Null
     Wait-Phase $deniedId 'AwaitingApproval' | Out-Null
@@ -236,7 +295,9 @@ try {
     $until = [DateTime]::UtcNow.AddSeconds(30)
     do {
         $wrong = Wait-Phase $deniedId 'AwaitingApproval'
-        if ($null -ne $wrong.status.Detail) { break }
+        if ($null -ne $wrong.status.Detail) {
+            break
+        }
         Start-Sleep -Milliseconds 400
     } while ([DateTime]::UtcNow -lt $until)
     Assert-True ($null -ne $wrong.status.Detail) 'Receipt for another itinerary was not rejected.'
@@ -248,6 +309,7 @@ try {
     Export-Instance $agentsDll $deniedId | Out-Null
     $cases.Add([ordered]@{ case = 'cross-itinerary-receipt-rejected-denial-no-bookings'; realScheduler = $true; passed = $true; instanceId = $deniedId })
 
+    # The summary of every case, next to the evidence files.
     [ordered]@{
         passed = $true; utc = [DateTime]::UtcNow; emulatorImage = $EmulatorImage; containerId = $containerId;
         blog = 'https://www.tamirdresher.com/blog/2026/10/16/copilot-workflows-durability';
@@ -259,14 +321,21 @@ try {
     Write-Output "PASS: $($cases.Count) cases (1 naive + 5 real Scheduler); evidence: $artifactPath"
 }
 catch {
+    # Keep the evidence of the cases that passed before the failure, then fail.
     [ordered]@{ passed = $false; error = $_.Exception.Message; cases = $cases; workerCrashes = $script:Crashes } |
         ConvertTo-Json -Depth 30 | Set-Content (Join-Path $artifactPath 'results.json')
     throw
 }
 finally {
+    # Stop what this script started and restore the environment.
     Stop-Worker
-    if ($null -ne $baseline -and -not $baseline.HasExited) { Stop-Process -Id $baseline.Id -Force; $baseline.WaitForExit() }
-    if ($containerId) { & docker stop $containerId | Out-Null }
+    if ($null -ne $baseline -and -not $baseline.HasExited) {
+        Stop-Process -Id $baseline.Id -Force
+        $baseline.WaitForExit()
+    }
+    if ($containerId) {
+        & docker stop $containerId | Out-Null
+    }
     $env:PRAGUE_BOOKING_DATA = $previous.data
     $env:PRAGUE_DTS_ENDPOINT = $previous.endpoint
     $env:PRAGUE_BOOKING_CRASH = $previous.crash

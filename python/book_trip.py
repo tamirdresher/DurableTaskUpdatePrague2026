@@ -26,6 +26,7 @@ def book(service: str, operation_id: str) -> dict:
     """Fake provider: one booking per operation ID, like a real idempotency key."""
     LEDGER.mkdir(parents=True, exist_ok=True)
     path = LEDGER / f"booking-{operation_id.replace('/', '_')}.json"
+    # Same key, same booking: an activity that runs again gets the existing receipt back.
     if path.exists():
         return json.loads(path.read_text())
     receipt = {"operation_id": operation_id, "service": service, "booked_by_pid": os.getpid()}
@@ -33,6 +34,7 @@ def book(service: str, operation_id: str) -> dict:
     return receipt
 
 
+# Activities do the I/O. They run at least once, maybe more, so each passes its stable key to the provider.
 def book_flight(ctx: task.ActivityContext, operation_id: str) -> dict:
     return book("flight", operation_id)
 
@@ -42,6 +44,8 @@ def book_hotel(ctx: task.ActivityContext, operation_id: str) -> dict:
 
 
 def book_car(ctx: task.ActivityContext, operation_id: str) -> dict:
+    # Crash once, like CrashHook in C#: the marker file lets a restarted worker book the car instead of
+    # crashing again. os._exit skips all cleanup, as close to pulling the plug as Python gets.
     marker = LEDGER / f"crash-{operation_id.replace('/', '_')}"
     if os.getenv("PRAGUE_BOOKING_CRASH") == "before-car" and not marker.exists():
         LEDGER.mkdir(parents=True, exist_ok=True)
@@ -51,6 +55,9 @@ def book_car(ctx: task.ActivityContext, operation_id: str) -> dict:
     return book("car", operation_id)
 
 
+# The orchestrator. `yield` works like `await` in C#: on replay, a yield whose activity already has a saved
+# result gets it back at once, and the first one without a result schedules the activity. The keys are
+# stable, "<instance>/<service>", so a retried activity reuses its key.
 def book_trip(ctx: task.OrchestrationContext, trip: dict):
     flight = yield ctx.call_activity(
         book_flight, input=f"{ctx.instance_id}/flight")
@@ -61,11 +68,13 @@ def book_trip(ctx: task.OrchestrationContext, trip: dict):
     return {"trip": trip, "bookings": [flight, hotel, car]}
 
 
+# Local emulator only: plain gRPC without TLS, task hub "default", no credential.
 def connect_client() -> DurableTaskSchedulerClient:
     return DurableTaskSchedulerClient(
         host_address=ENDPOINT, secure_channel=False, taskhub="default", token_credential=None)
 
 
+# Registers the orchestrator and the activities, then takes work from the scheduler until the process stops.
 def run_worker() -> None:
     with DurableTaskSchedulerWorker(
             host_address=ENDPOINT, secure_channel=False, taskhub="default", token_credential=None) as worker:
@@ -75,10 +84,12 @@ def run_worker() -> None:
         worker.add_activity(book_car)
         worker.start()
         print(f"python worker {os.getpid()} connected to {ENDPOINT}", flush=True)
+        # The worker runs on background threads; block here forever.
         threading.Event().wait()
 
 
 def main(args: list[str]) -> int:
+    # Like the C# CLIs, talk only to the local emulator.
     if not ENDPOINT.startswith(("http://localhost:", "http://127.0.0.1:")):
         print("This sample only talks to the local emulator.", file=sys.stderr)
         return 2
@@ -87,6 +98,7 @@ def main(args: list[str]) -> int:
         run_worker()
         return 0
     if command == "ledger":
+        # What the fake provider booked, counted per service.
         receipts = [json.loads(p.read_text()) for p in sorted(LEDGER.glob("booking-*.json"))]
         counts = {s: sum(r["service"] == s for r in receipts) for s in ("flight", "hotel", "car")}
         print(json.dumps({"counts": counts, "receipts": receipts}, indent=2))
@@ -94,6 +106,7 @@ def main(args: list[str]) -> int:
     if command in ("start", "wait") and len(args) == 2:
         client = connect_client()
         if command == "start":
+            # The caller chooses the instance ID, and the activity keys are built from it.
             trip = {"from": "SFO", "to": "Seattle"}
             print(client.schedule_new_orchestration(book_trip, input=trip, instance_id=args[1]))
             return 0
