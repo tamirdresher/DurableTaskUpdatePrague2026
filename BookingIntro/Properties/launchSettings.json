@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json.schemastore.org/launchsettings.json",
+  "profiles": {
+    "naive": {
+      "commandName": "Project",
+      "commandLineArgs": "naive"
+    },
+    "worker": {
+      "commandName": "Project",
+      "commandLineArgs": "worker"
+    },
+    "start": {
+      "commandName": "Project",
+      "commandLineArgs": "start"
+    },
+    "status": {
+      "commandName": "Project",
+      "commandLineArgs": "status"
+    },
+    "wait": {
+      "commandName": "Project",
+      "commandLineArgs": "wait"
+    },
+    "history": {
+      "commandName": "Project",
+      "commandLineArgs": "history"
+    },
+    "ledger": {
+      "commandName": "Project",
+      "commandLineArgs": "ledger"
+    }
+  }
+}

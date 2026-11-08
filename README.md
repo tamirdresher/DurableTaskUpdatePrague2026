@@ -47,6 +47,20 @@ Each step waits for Enter. To check everything at once, run `./Stage.ps1 rehears
 
 In the dashboard (`http://localhost:18082`), open the `default` task hub, choose an instance such as `trip-1`, and look at **Timeline** and **History**.
 
+## Debug one command
+
+`BookingIntro` and `BookingAgents` are small command-line apps: `worker` hosts the orchestrator and its activities, and the other commands are clients of the scheduler. Every argument after the command is optional, so you can run any command in a debugger without typing anything:
+
+```text
+BookingIntro:   worker | naive [trip-id] | start [instance-id] [trip-id] | status|wait|history [instance-id] | ledger
+BookingAgents:  worker | start [instance-id] [approval-seconds] | status|wait|history|approve|deny [instance-id] | signal [instance-id] [receipt-id]
+```
+
+- Without an instance ID, `start` makes a new one (`trip-HHmmss` or `agents-HHmmss`), and the other commands use the instance that `start` created last. It's remembered in the data folder, `data/booking` under the working directory.
+- `naive` books `seattle-trip`, the approval window is 900 seconds, and `signal` sends a random receipt ID, which validation rejects.
+- Each project has a launch profile for each command in `Properties/launchSettings.json`. Choose one in Visual Studio, VS Code or Rider and press F5. From a terminal, run `dotnet run --project BookingIntro --launch-profile worker`, or pass the arguments yourself: `dotnet run --project BookingIntro -- start my-trip`.
+- Every command except `naive` and `ledger` needs the emulator, so run `./Stage.ps1 setup` first. Stop your own worker before you run a Stage act: a second worker on the same task hub takes work too.
+
 ## Python
 
 The same workflow with [durabletask-python](https://github.com/microsoft/durabletask-python), against the same emulator. Start it with `./Stage.ps1 setup` first.

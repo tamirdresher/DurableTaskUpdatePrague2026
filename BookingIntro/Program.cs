@@ -18,7 +18,8 @@ try
 {
     if (args.Length == 0)
     {
-        Console.Error.WriteLine("Commands: worker | naive <trip-id> | start <instance-id> [trip-id] | status|wait|history <instance-id> | ledger");
+        Console.Error.WriteLine("Commands: worker | naive [trip-id] | start [instance-id] [trip-id] | status|wait|history [instance-id] | ledger");
+        Console.Error.WriteLine("Arguments in [brackets] are optional. Properties/launchSettings.json has a launch profile for each command.");
         return 2;
     }
     string command = args[0].ToLowerInvariant();
@@ -29,13 +30,13 @@ try
     // "naive": the same three bookings as plain async code (NaiveTrip), no Durable Task.
     if (command == "naive")
     {
-        if (args.Length < 2)
-            throw new ArgumentException("Supply a trip ID.");
+        // The trip ID is optional, to make debugging easy. Stage.ps1 passes this same one.
+        string tripId = args.Length > 1 ? args[1] : "seattle-trip";
         // A new attempt ID on every run means new operation IDs, so the provider can't tell a rerun
         // from a new trip: a rerun books everything again.
         string attemptId = "naive-" + Guid.NewGuid().ToString("N");
         Console.WriteLine($"NAIVE ordinary async attempt={attemptId}; MOCK providers only.");
-        Print(await NaiveTrip.BookAsync(booking, new Trip(args[1]), attemptId));
+        Print(await NaiveTrip.BookAsync(booking, new Trip(tripId), attemptId));
         return 0;
     }
 
@@ -90,9 +91,22 @@ try
     DurableTaskClient client = app.Services.GetRequiredService<DurableTaskClient>();
     // "wait" may have to outlast a worker restart; the other calls return quickly.
     using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(command == "wait" ? 240 : 30));
+
+    // The instance ID is optional, to make debugging easy (Stage.ps1 and Rehearse.ps1 always pass one).
+    // Without it, "start" makes a new ID, and status, wait and history use the trip that "start" created last.
+    string lastInstanceFile = Path.Combine(ledger.Root, "last-trip-instance.txt");
+    string id;
+    if (args.Length > 1)
+        id = args[1];
+    else if (command == "start")
+        id = $"trip-{DateTime.Now:HHmmss}";
+    else if (File.Exists(lastInstanceFile))
+        id = File.ReadAllText(lastInstanceFile).Trim();
+    else
+        throw new ArgumentException("Supply an instance ID, or run start first.");
     if (args.Length < 2)
-        throw new ArgumentException("Supply an instance ID.");
-    string id = args[1];
+        Console.Error.WriteLine($"No instance ID given; using '{id}'.");
+
     switch (command)
     {
         case "start":
@@ -101,6 +115,8 @@ try
             Trip trip = new(args.Length > 2 ? args[2] : id);
             string instanceId = await client.ScheduleNewOrchestrationInstanceAsync(nameof(BookTrip), trip,
                 new StartOrchestrationOptions { InstanceId = id }, cancellation.Token);
+            // Remember it, so the next commands can leave the ID out.
+            File.WriteAllText(lastInstanceFile, instanceId);
             Print(new { instanceId, trip, provider = "LOCAL MOCK; not real reservations." });
             break;
         case "status":

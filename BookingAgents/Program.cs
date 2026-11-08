@@ -19,7 +19,8 @@ try
 {
     if (args.Length == 0)
     {
-        Console.Error.WriteLine("Commands: worker | start <instance-id> [approval-seconds] | status|wait|history|approve|deny <instance-id> | signal <instance-id> <receipt-id>");
+        Console.Error.WriteLine("Commands: worker | start [instance-id] [approval-seconds] | status|wait|history|approve|deny [instance-id] | signal [instance-id] [receipt-id]");
+        Console.Error.WriteLine("Arguments in [brackets] are optional. Properties/launchSettings.json has a launch profile for each command.");
         return 2;
     }
     string command = args[0].ToLowerInvariant();
@@ -75,16 +76,32 @@ try
     using IHost app = builder.Build();
     DurableTaskClient client = app.Services.GetRequiredService<DurableTaskClient>();
     using CancellationTokenSource cancellation = new(TimeSpan.FromSeconds(command == "wait" ? 240 : 30));
+
+    // The instance ID is optional, to make debugging easy (Stage.ps1 and Rehearse.ps1 always pass one).
+    // Without it, "start" makes a new ID, and the other commands use the trip that "start" created last.
+    string lastInstanceFile = Path.Combine(ledger.Root, "last-agents-instance.txt");
+    string id;
+    if (args.Length > 1)
+        id = args[1];
+    else if (command == "start")
+        id = $"agents-{DateTime.Now:HHmmss}";
+    else if (File.Exists(lastInstanceFile))
+        id = File.ReadAllText(lastInstanceFile).Trim();
+    else
+        throw new ArgumentException("Supply an instance ID, or run start first.");
     if (args.Length < 2)
-        throw new ArgumentException("Supply an instance ID.");
-    string id = args[1];
+        Console.Error.WriteLine($"No instance ID given; using '{id}'.");
+
     switch (command)
     {
         case "start":
-            // The caller chooses the instance ID; the optional argument is the approval window in seconds.
-            TripInput input = new(new Trip(id), args.Length > 2 ? int.Parse(args[2]) : 120);
+            // The caller chooses the instance ID. The optional second argument is the approval window in seconds:
+            // 900 (15 minutes, as in the talk) by default, which leaves time to step through in a debugger.
+            TripInput input = new(new Trip(id), args.Length > 2 ? int.Parse(args[2]) : 900);
             string instanceId = await client.ScheduleNewOrchestrationInstanceAsync(nameof(PlanAndBookTrip), input,
                 new StartOrchestrationOptions { InstanceId = id }, cancellation.Token);
+            // Remember it, so the next commands can leave the ID out.
+            File.WriteAllText(lastInstanceFile, instanceId);
             Print(new { instanceId, fixtures = "OFFLINE SCRIPTED; LOCAL MOCK ONLY" });
             break;
         case "status":
@@ -115,9 +132,9 @@ try
         case "signal":
             // Raises the approval event with any receipt ID and issues nothing: the fake approval in the demo.
             // Validation rejects it unless a matching receipt for this exact proposal exists.
-            if (args.Length != 3)
-                throw new ArgumentException("Supply a receipt ID; unknown receipts fail independent validation.");
-            await client.RaiseEventAsync(id, PlanAndBookTrip.ApprovalEvent, new ApprovalSignal(args[2]), cancellation.Token);
+            // Without a receipt ID, it sends a random one, as Stage.ps1 does.
+            string receiptId = args.Length > 2 ? args[2] : Guid.NewGuid().ToString("N");
+            await client.RaiseEventAsync(id, PlanAndBookTrip.ApprovalEvent, new ApprovalSignal(receiptId), cancellation.Token);
             Print(new { signaled = id, authorization = "NONE: notifications are not authorization." });
             break;
         case "history":
